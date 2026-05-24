@@ -82,9 +82,3 @@ The R Markdown files use:
 - `lme4`
 - `lmerTest`
 - `broom.mixed`
-
-## Notes
-
-The parcel-level and lateralization notebooks are labeled exploratory because
-some analyses were used for follow-up inspection rather than as the main
-confirmatory results.
