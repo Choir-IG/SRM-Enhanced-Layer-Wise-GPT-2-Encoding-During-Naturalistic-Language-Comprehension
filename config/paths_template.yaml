@@ -1,0 +1,10 @@
+# Copy this file to paths.yaml and replace placeholders with local paths.
+
+project_root: "YOUR_PROJECT_ROOT"
+snl2026_root: "YOUR_SNL2026_ROOT"
+fmri_data_dir: "YOUR_FMRI_DATA_DIR"
+schaefer400_atlas_nii: "YOUR_SCHAEFER400_ATLAS_NIFTI_PATH"
+schaefer400_label_txt: "YOUR_SCHAEFER400_LABEL_TXT_PATH"
+transcript_path: "YOUR_TRANSCRIPT_TXT_PATH"
+alignment_csv: "YOUR_WORD_ONSET_OFFSET_CSV_PATH"
+audio_path: "YOUR_AUDIO_FILE_PATH"
