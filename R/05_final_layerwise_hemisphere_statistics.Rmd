@@ -1,0 +1,1143 @@
+---
+title: "Final Layer-Wise Hemisphere Analysis For SRM+LLM Encoding"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# This Rmd organizes the layer-wise hemisphere analysis around three questions:
+#
+# Q1. After SRM reconstruction, which hemisphere shows stronger GPT-2 encoding?
+# Q2. Which hemisphere shows larger SRM-related encoding gain?
+# Q3. Does the LH/RH difference depend on GPT-2 layer depth?
+#
+# The code keeps the original logic: Welch independent tests are used first for
+# LH-vs-RH parcel comparisons, and permutation tests are used as robustness checks.
+
+options(scipen = 999)
+
+required_packages <- c("tidyverse", "readr", "ggplot2", "writexl", "broom")
+optional_packages <- c("lme4", "lmerTest", "broom.mixed")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(paste("Required R package is not installed:", pkg))
+  }
+}
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+HAS_LMER <- all(vapply(optional_packages, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1)))
+if (HAS_LMER) {
+  invisible(lapply(optional_packages, library, character.only = TRUE))
+}
+
+BASE_DIR <- "YOUR_PROJECT_ROOT"
+
+PARCEL_LAYER_PATH <- file.path(
+  BASE_DIR,
+  "parcel_layer_network_outputs",
+  "step11A_build_parcel_level_encoding_table",
+  "csv",
+  "step11A_parcel_layer_encoding_table.csv"
+)
+
+PARCEL_GAIN_PATH <- file.path(
+  BASE_DIR,
+  "parcel_layer_network_outputs",
+  "step11D_parcel_level_srm_gain_maps",
+  "csv",
+  "step11D_parcel_srm_gain_metrics.csv"
+)
+
+OUT_DIR <- file.path(BASE_DIR, "final_r_test_outputs")
+TABLE_DIR <- file.path(OUT_DIR, "organized_tables")
+FIGURE_DIR <- file.path(OUT_DIR, "organized_figures")
+
+dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURE_DIR, recursive = TRUE, showWarnings = FALSE)
+
+NETWORK_ORDER <- c(
+  "VisCent", "VisPeri",
+  "SomMotA", "SomMotB",
+  "DorsAttnA", "DorsAttnB",
+  "SalVentAttnA", "SalVentAttnB",
+  "LimbicA", "LimbicB",
+  "ContA", "ContB", "ContC",
+  "DefaultA", "DefaultB", "DefaultC",
+  "TempPar"
+)
+
+LAYER_DEPTH_ORDER <- c("embedding", "early", "early_middle", "middle_late", "late")
+
+MIN_N_PER_HEMI <- 4
+N_PERM_LAYER_DEPTH <- 10000
+N_PERM_EXACT_LAYER <- 10000
+PERMUTATION_SEED <- 123
+RUN_EXACT_LAYER_TESTS <- TRUE
+
+fmt_num5 <- function(x) {
+  ifelse(is.na(x), NA_character_, sprintf("%.5f", as.numeric(x)))
+}
+
+fmt_p5 <- function(p) {
+  case_when(
+    is.na(p) ~ NA_character_,
+    p < 0.00001 ~ "<0.00001",
+    TRUE ~ sprintf("%.5f", p)
+  )
+}
+
+sig_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "ns",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+add_note <- function(df, note) {
+  df %>% mutate(analysis_note = note, .before = 1)
+}
+
+add_grouped_fdr <- function(df, group_cols, p_col = "p_value", out_col = "p_fdr") {
+  df %>%
+    group_by(across(all_of(group_cols))) %>%
+    mutate("{out_col}" := ifelse(is.na(.data[[p_col]]), NA_real_, p.adjust(.data[[p_col]], method = "BH"))) %>%
+    ungroup() %>%
+    mutate(
+      p_value_print = fmt_p5(.data[[p_col]]),
+      p_fdr_print = fmt_p5(.data[[out_col]]),
+      significance = sig_stars(.data[[out_col]]),
+      fdr_family = paste(group_cols, collapse = " + ")
+    )
+}
+
+cohens_d_independent <- function(left_vals, right_vals) {
+  left_vals <- left_vals[is.finite(left_vals)]
+  right_vals <- right_vals[is.finite(right_vals)]
+  n_left <- length(left_vals)
+  n_right <- length(right_vals)
+  if (n_left < 2 || n_right < 2) return(NA_real_)
+  pooled_sd <- sqrt(
+    ((n_left - 1) * stats::var(left_vals) + (n_right - 1) * stats::var(right_vals)) /
+      (n_left + n_right - 2)
+  )
+  if (!is.finite(pooled_sd) || pooled_sd == 0) return(NA_real_)
+  (mean(left_vals) - mean(right_vals)) / pooled_sd
+}
+
+safe_welch_test <- function(df, value_col, group_col = "hemisphere") {
+  dat <- df %>%
+    transmute(
+      value = as.numeric(.data[[value_col]]),
+      group = as.factor(.data[[group_col]])
+    ) %>%
+    filter(is.finite(value), !is.na(group))
+
+  left_vals <- dat %>% filter(group == "LH") %>% pull(value)
+  right_vals <- dat %>% filter(group == "RH") %>% pull(value)
+
+  base_row <- tibble(
+    value_col = value_col,
+    n_left = length(left_vals),
+    n_right = length(right_vals),
+    mean_left = ifelse(length(left_vals) > 0, mean(left_vals), NA_real_),
+    mean_right = ifelse(length(right_vals) > 0, mean(right_vals), NA_real_),
+    median_left = ifelse(length(left_vals) > 0, median(left_vals), NA_real_),
+    median_right = ifelse(length(right_vals) > 0, median(right_vals), NA_real_),
+    sd_left = ifelse(length(left_vals) > 1, sd(left_vals), NA_real_),
+    sd_right = ifelse(length(right_vals) > 1, sd(right_vals), NA_real_),
+    mean_difference_left_minus_right = ifelse(
+      length(left_vals) > 0 && length(right_vals) > 0,
+      mean(left_vals) - mean(right_vals),
+      NA_real_
+    ),
+    cohen_d_left_minus_right = cohens_d_independent(left_vals, right_vals),
+    test_method = "two-sided Welch independent t-test"
+  )
+
+  if (length(left_vals) < MIN_N_PER_HEMI || length(right_vals) < MIN_N_PER_HEMI) {
+    return(base_row %>%
+      mutate(
+        statistic = NA_real_,
+        df = NA_real_,
+        p_value = NA_real_,
+        note = paste0("Skipped: fewer than ", MIN_N_PER_HEMI, " parcels in at least one hemisphere")
+      ))
+  }
+
+  fit <- stats::t.test(left_vals, right_vals, paired = FALSE, alternative = "two.sided")
+
+  base_row %>%
+    mutate(
+      statistic = unname(fit$statistic),
+      df = unname(fit$parameter),
+      p_value = unname(fit$p.value),
+      note = NA_character_
+    )
+}
+
+safe_permutation_test <- function(df, value_col, group_col = "hemisphere", n_perm = N_PERM_LAYER_DEPTH) {
+  dat <- df %>%
+    transmute(
+      value = as.numeric(.data[[value_col]]),
+      group = as.factor(.data[[group_col]])
+    ) %>%
+    filter(is.finite(value), !is.na(group))
+
+  left_vals <- dat %>% filter(group == "LH") %>% pull(value)
+  right_vals <- dat %>% filter(group == "RH") %>% pull(value)
+
+  base_row <- tibble(
+    value_col = value_col,
+    n_left = length(left_vals),
+    n_right = length(right_vals),
+    mean_left = ifelse(length(left_vals) > 0, mean(left_vals), NA_real_),
+    mean_right = ifelse(length(right_vals) > 0, mean(right_vals), NA_real_),
+    median_left = ifelse(length(left_vals) > 0, median(left_vals), NA_real_),
+    median_right = ifelse(length(right_vals) > 0, median(right_vals), NA_real_),
+    sd_left = ifelse(length(left_vals) > 1, sd(left_vals), NA_real_),
+    sd_right = ifelse(length(right_vals) > 1, sd(right_vals), NA_real_),
+    mean_difference_left_minus_right = ifelse(
+      length(left_vals) > 0 && length(right_vals) > 0,
+      mean(left_vals) - mean(right_vals),
+      NA_real_
+    ),
+    cohen_d_left_minus_right = cohens_d_independent(left_vals, right_vals),
+    test_method = "two-sided label-permutation mean-difference test",
+    n_perm = n_perm
+  )
+
+  if (length(left_vals) < MIN_N_PER_HEMI || length(right_vals) < MIN_N_PER_HEMI) {
+    return(base_row %>%
+      mutate(
+        p_value = NA_real_,
+        note = paste0("Skipped: fewer than ", MIN_N_PER_HEMI, " parcels in at least one hemisphere")
+      ))
+  }
+
+  observed_diff <- mean(left_vals) - mean(right_vals)
+  all_vals <- c(left_vals, right_vals)
+  n_left <- length(left_vals)
+
+  perm_diffs <- replicate(n_perm, {
+    shuffled <- sample(all_vals, length(all_vals), replace = FALSE)
+    mean(shuffled[seq_len(n_left)]) - mean(shuffled[(n_left + 1):length(shuffled)])
+  })
+
+  p_perm <- (sum(abs(perm_diffs) >= abs(observed_diff)) + 1) / (n_perm + 1)
+
+  base_row %>%
+    mutate(
+      p_value = p_perm,
+      note = NA_character_
+    )
+}
+
+format_report_sentence <- function(row) {
+  if (is.na(row[["p_value"]])) return(NA_character_)
+  paste0(
+    row[["roi_name"]], " | ", row[["metric_label"]], " | ", row[["layer_depth"]],
+    ": LH-RH = ", fmt_num5(row[["mean_difference_left_minus_right"]]),
+    ", t(", fmt_num5(row[["df"]]), ") = ", fmt_num5(row[["statistic"]]),
+    ", p = ", fmt_p5(row[["p_value"]]),
+    ", FDR p = ", fmt_p5(row[["p_fdr"]]), "."
+  )
+}
+```
+
+# 1. Load And Validate Inputs
+
+```{r load-validate}
+if (!file.exists(PARCEL_LAYER_PATH)) stop(paste("Missing parcel-layer input:", PARCEL_LAYER_PATH))
+if (!file.exists(PARCEL_GAIN_PATH)) stop(paste("Missing parcel-gain input:", PARCEL_GAIN_PATH))
+
+parcel_layer_df <- readr::read_csv(PARCEL_LAYER_PATH, show_col_types = FALSE)
+parcel_gain_df <- readr::read_csv(PARCEL_GAIN_PATH, show_col_types = FALSE)
+
+required_layer_cols <- c(
+  "roi_name", "network_family", "parcel_id", "parcel_label", "hemisphere",
+  "layer_index", "layer_label", "log_layer_depth_percent", "layer_depth_bin",
+  "raw_mean_r", "srm_mean_r", "delta_mean_r"
+)
+missing_layer_cols <- setdiff(required_layer_cols, names(parcel_layer_df))
+if (length(missing_layer_cols) > 0) {
+  stop(paste("Missing columns in parcel_layer_df:", paste(missing_layer_cols, collapse = ", ")))
+}
+
+required_gain_cols <- c(
+  "roi_name", "network_family", "parcel_id", "parcel_label", "hemisphere",
+  "best_srm_r", "same_layer_gain", "overall_mean_gain", "best_srm_log_depth_percent",
+  "best_srm_depth_bin"
+)
+missing_gain_cols <- setdiff(required_gain_cols, names(parcel_gain_df))
+if (length(missing_gain_cols) > 0) {
+  stop(paste("Missing columns in parcel_gain_df:", paste(missing_gain_cols, collapse = ", ")))
+}
+
+clean_hemi <- function(x) {
+  case_when(
+    x %in% c("LH", "left", "Left", "L", "l") ~ "LH",
+    x %in% c("RH", "right", "Right", "R", "r") ~ "RH",
+    TRUE ~ as.character(x)
+  )
+}
+
+available_layer_depths <- unique(as.character(parcel_layer_df$layer_depth_bin))
+layer_depth_order_used <- LAYER_DEPTH_ORDER[LAYER_DEPTH_ORDER %in% available_layer_depths]
+if (length(layer_depth_order_used) == 0) {
+  stop("No recognized layer-depth categories were found in parcel_layer_df$layer_depth_bin.")
+}
+
+parcel_layer_df <- parcel_layer_df %>%
+  mutate(
+    roi_name = factor(roi_name, levels = NETWORK_ORDER),
+    hemisphere = factor(clean_hemi(hemisphere), levels = c("LH", "RH")),
+    layer_index = as.integer(layer_index),
+    layer_depth = factor(layer_depth_bin, levels = layer_depth_order_used),
+    log_layer_depth_percent = as.numeric(log_layer_depth_percent),
+    parcel_id = as.factor(parcel_id),
+    raw_mean_r = as.numeric(raw_mean_r),
+    srm_mean_r = as.numeric(srm_mean_r),
+    delta_mean_r = as.numeric(delta_mean_r)
+  )
+
+parcel_gain_df <- parcel_gain_df %>%
+  mutate(
+    roi_name = factor(roi_name, levels = NETWORK_ORDER),
+    hemisphere = factor(clean_hemi(hemisphere), levels = c("LH", "RH")),
+    best_srm_layer_depth = factor(best_srm_depth_bin, levels = layer_depth_order_used),
+    parcel_id = as.factor(parcel_id),
+    best_srm_r = as.numeric(best_srm_r),
+    same_layer_gain = as.numeric(same_layer_gain),
+    overall_mean_gain = as.numeric(overall_mean_gain),
+    best_srm_log_depth_percent = as.numeric(best_srm_log_depth_percent)
+  )
+
+critical_cols <- c("raw_mean_r", "srm_mean_r", "delta_mean_r", "log_layer_depth_percent")
+if (any(!is.finite(as.matrix(parcel_layer_df[critical_cols])))) {
+  stop("Non-finite values detected in critical parcel-layer numeric columns.")
+}
+
+hemisphere_counts <- parcel_gain_df %>%
+  distinct(roi_name, network_family, parcel_id, hemisphere) %>%
+  count(roi_name, network_family, hemisphere, name = "n_parcels") %>%
+  tidyr::pivot_wider(names_from = hemisphere, values_from = n_parcels, values_fill = 0) %>%
+  mutate(
+    n_total = LH + RH,
+    min_n_per_hemi = pmin(LH, RH),
+    sufficient_for_independent_tests = min_n_per_hemi >= MIN_N_PER_HEMI
+  ) %>%
+  arrange(factor(roi_name, levels = NETWORK_ORDER)) %>%
+  add_note(
+    "This table checks how many left- and right-hemisphere parcels are available in each network. It matters because all LH/RH parcel tests are independent tests and require enough parcels in both hemispheres."
+  )
+
+input_sanity_summary <- tibble(
+  n_rows_parcel_layer = nrow(parcel_layer_df),
+  n_unique_parcels = n_distinct(parcel_layer_df$parcel_id),
+  n_networks = n_distinct(parcel_layer_df$roi_name),
+  n_layers = n_distinct(parcel_layer_df$layer_index),
+  n_layer_depth_categories = n_distinct(parcel_layer_df$layer_depth),
+  layer_depth_categories = paste(layer_depth_order_used, collapse = ", "),
+  n_rows_parcel_gain = nrow(parcel_gain_df),
+  has_lmer = HAS_LMER,
+  exact_layer_tests_enabled = RUN_EXACT_LAYER_TESTS
+) %>%
+  add_note(
+    "This table verifies that the input data contain the expected parcel-layer rows, networks, GPT-2 layers, and layer-depth categories before running hemisphere statistics."
+  )
+
+input_sanity_summary
+hemisphere_counts
+```
+
+# 2. Define Outcomes And Analysis Questions
+
+```{r define-outcomes}
+metric_labels <- c(
+  delta_mean_r = "SRM-related encoding gain (SRM+LLM - Raw+LLM)",
+  srm_mean_r = "SRM+LLM encoding r",
+  raw_mean_r = "Raw+LLM encoding r"
+)
+
+question_table <- tribble(
+  ~analysis_question, ~primary_metric, ~statistical_test, ~interpretation,
+  "Q1: Which hemisphere shows stronger SRM+LLM encoding?", "srm_mean_r",
+  "Welch/permutation tests within layer depth, plus mixed-effects models across continuous layer depth.",
+  "This asks whether left- or right-hemisphere parcels are more predictable from GPT-2 after SRM reconstruction.",
+  "Q2: Which hemisphere shows larger SRM-related encoding gain?", "delta_mean_r",
+  "Welch/permutation tests within layer depth, plus mixed-effects models across continuous layer depth.",
+  "This asks whether SRM improves LLM encoding more strongly in left- or right-hemisphere parcels.",
+  "Q3: Does the hemisphere effect depend on GPT-2 layer depth?", "delta_mean_r and srm_mean_r",
+  "Network-wise mixed-effects models and layer-depth follow-up tests.",
+  "This asks whether LH/RH differences change from embedding/early layers to middle-late/late GPT-2 representations."
+) %>%
+  add_note(
+    "This sheet is the roadmap for the Rmd. The final tables are ordered around these three questions rather than around implementation details."
+  )
+
+outcome_definition <- tibble(
+  variable = names(metric_labels),
+  label = unname(metric_labels),
+  meaning = c(
+    "The gain attributable to SRM reconstruction at a given parcel and GPT-2 layer.",
+    "The final encoding strength when GPT-2 predicts SRM-reconstructed responses.",
+    "The baseline encoding strength when GPT-2 predicts raw anatomically aligned responses."
+  )
+) %>%
+  add_note(
+    "This table defines the variables used in the statistical tests. The main outcome is delta_mean_r; srm_mean_r is the final predictability measure; raw_mean_r is retained as baseline context."
+  )
+
+question_table
+outcome_definition
+```
+
+# 3. Q1 And Q2: LH/RH Profiles Across GPT-2 Layers
+
+```{r profiles, fig.width=16, fig.height=10}
+profile_df <- parcel_layer_df %>%
+  group_by(roi_name, network_family, hemisphere, layer_index, layer_label, layer_depth) %>%
+  summarise(
+    raw_mean_r = mean(raw_mean_r, na.rm = TRUE),
+    srm_mean_r = mean(srm_mean_r, na.rm = TRUE),
+    delta_mean_r = mean(delta_mean_r, na.rm = TRUE),
+    n_parcels = n_distinct(parcel_id),
+    .groups = "drop"
+  ) %>%
+  mutate(roi_name = factor(roi_name, levels = NETWORK_ORDER)) %>%
+  add_note(
+    "This table averages parcel-level values within each network, hemisphere, and GPT-2 layer. It visualizes whether LH/RH differences are broad trends or restricted to specific layer depths."
+  )
+
+profile_long_df <- profile_df %>%
+  select(-analysis_note) %>%
+  pivot_longer(
+    cols = all_of(c("delta_mean_r", "srm_mean_r")),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(metric_label = recode(metric, !!!metric_labels))
+
+p_delta_profiles <- profile_long_df %>%
+  filter(metric == "delta_mean_r") %>%
+  ggplot(aes(x = layer_index, y = value, color = hemisphere)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.35) +
+  geom_line(linewidth = 0.8, alpha = 0.9) +
+  facet_wrap(~ roi_name, ncol = 5, scales = "fixed") +
+  scale_color_manual(values = c("LH" = "#D55E00", "RH" = "#0072B2")) +
+  labs(
+    title = "Q2: LH/RH SRM-Related Encoding Gain Across GPT-2 Layers",
+    x = "GPT-2 representation index (0 = embedding; 1-48 = transformer layers)",
+    y = "Mean gain in encoding r (SRM+LLM - Raw+LLM)",
+    color = "Hemisphere"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "right", strip.text = element_text(face = "bold"))
+
+p_delta_profiles
+
+ggsave(
+  filename = file.path(FIGURE_DIR, "Q2_lh_rh_srm_gain_layer_profiles.png"),
+  plot = p_delta_profiles,
+  width = 16,
+  height = 10,
+  dpi = 300
+)
+
+p_srm_profiles <- profile_long_df %>%
+  filter(metric == "srm_mean_r") %>%
+  ggplot(aes(x = layer_index, y = value, color = hemisphere)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.35) +
+  geom_line(linewidth = 0.8, alpha = 0.9) +
+  facet_wrap(~ roi_name, ncol = 5, scales = "fixed") +
+  scale_color_manual(values = c("LH" = "#D55E00", "RH" = "#0072B2")) +
+  labs(
+    title = "Q1: LH/RH SRM+LLM Encoding Across GPT-2 Layers",
+    x = "GPT-2 representation index (0 = embedding; 1-48 = transformer layers)",
+    y = "Mean SRM+LLM encoding r",
+    color = "Hemisphere"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "right", strip.text = element_text(face = "bold"))
+
+p_srm_profiles
+
+ggsave(
+  filename = file.path(FIGURE_DIR, "Q1_lh_rh_srm_encoding_layer_profiles.png"),
+  plot = p_srm_profiles,
+  width = 16,
+  height = 10,
+  dpi = 300
+)
+```
+
+# 4. Q3: Network-Wise Mixed-Effects Models
+
+```{r mixed-models}
+if (!HAS_LMER) {
+  layer_model_results <- tibble(
+    analysis_note = "Mixed-effects models were skipped because lme4, lmerTest, or broom.mixed is not installed.",
+    model_question = NA_character_,
+    value_col = NA_character_,
+    roi_name = NA_character_,
+    network_family = NA_character_,
+    effect = NA_character_,
+    NumDF = NA_real_,
+    DenDF = NA_real_,
+    F_value = NA_real_,
+    p_value = NA_real_,
+    p_fdr = NA_real_,
+    significance = NA_character_
+  )
+} else {
+  run_network_lmer <- function(df, metric_name) {
+    dat <- df %>%
+      transmute(
+        value = as.numeric(.data[[metric_name]]),
+        hemisphere = factor(hemisphere, levels = c("RH", "LH")),
+        log_layer_depth_percent = as.numeric(log_layer_depth_percent),
+        parcel_id = as.factor(parcel_id)
+      ) %>%
+      filter(is.finite(value), is.finite(log_layer_depth_percent), !is.na(hemisphere))
+
+    if (nrow(dat) < 20 || n_distinct(dat$hemisphere) < 2 || n_distinct(dat$parcel_id) < 4) {
+      return(tibble(effect = NA_character_, NumDF = NA_real_, DenDF = NA_real_, F_value = NA_real_, p_value = NA_real_))
+    }
+
+    fit <- lmerTest::lmer(value ~ hemisphere * scale(log_layer_depth_percent) + (1 | parcel_id), data = dat)
+    an <- as.data.frame(anova(fit, type = 3)) %>%
+      rownames_to_column("effect") %>%
+      filter(effect != "(Intercept)")
+
+    an %>%
+      transmute(
+        effect = effect,
+        NumDF = .data[["NumDF"]],
+        DenDF = .data[["DenDF"]],
+        F_value = .data[["F value"]],
+        p_value = .data[["Pr(>F)"]]
+      )
+  }
+
+  layer_model_results <- purrr::map_dfr(c("delta_mean_r", "srm_mean_r"), function(metric_name) {
+    parcel_layer_df %>%
+      group_by(roi_name, network_family) %>%
+      group_modify(~ run_network_lmer(.x, metric_name)) %>%
+      ungroup() %>%
+      mutate(value_col = metric_name)
+  }) %>%
+    add_grouped_fdr(group_cols = c("value_col", "effect")) %>%
+    mutate(
+      metric_label = recode(value_col, !!!metric_labels),
+      model_question = case_when(
+        value_col == "srm_mean_r" ~ "Q1/Q3: final SRM+LLM encoding and its layer-depth dependence",
+        value_col == "delta_mean_r" ~ "Q2/Q3: SRM-related gain and its layer-depth dependence",
+        TRUE ~ "other"
+      ),
+      effect_label = recode(
+        effect,
+        hemisphere = "Hemisphere main effect",
+        `scale(log_layer_depth_percent)` = "Layer depth main effect",
+        `hemisphere:scale(log_layer_depth_percent)` = "Hemisphere x layer depth interaction",
+        .default = effect
+      )
+    ) %>%
+    arrange(value_col, effect, p_fdr, roi_name) %>%
+    add_note(
+      "This table is the main model-based answer to Q3. Each network is modeled separately with parcel as a random intercept; the hemisphere x layer-depth interaction tests whether LH/RH differences change across GPT-2 representational depth."
+    )
+}
+
+layer_model_results
+```
+
+# 5. Q1 And Q2 Follow-Up: Layer-Depth Welch Tests
+
+```{r layer-depth-welch}
+parcel_layer_depth_df <- parcel_layer_df %>%
+  group_by(roi_name, network_family, parcel_id, parcel_label, hemisphere, layer_depth) %>%
+  summarise(
+    raw_mean_r = mean(raw_mean_r, na.rm = TRUE),
+    srm_mean_r = mean(srm_mean_r, na.rm = TRUE),
+    delta_mean_r = mean(delta_mean_r, na.rm = TRUE),
+    n_layers_in_depth = dplyr::n(),
+    mean_log_layer_depth_percent = mean(log_layer_depth_percent, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    roi_name = factor(roi_name, levels = NETWORK_ORDER),
+    layer_depth = factor(layer_depth, levels = layer_depth_order_used)
+  )
+
+layer_depth_welch_tests <- purrr::map_dfr(c("delta_mean_r", "srm_mean_r"), function(metric_name) {
+  parcel_layer_depth_df %>%
+    group_by(roi_name, network_family, layer_depth) %>%
+    group_modify(~ safe_welch_test(.x, value_col = metric_name, group_col = "hemisphere")) %>%
+    ungroup()
+}) %>%
+  add_grouped_fdr(group_cols = c("value_col", "layer_depth")) %>%
+  mutate(
+    metric_label = recode(value_col, !!!metric_labels),
+    direction = case_when(
+      is.na(mean_difference_left_minus_right) ~ "undefined",
+      mean_difference_left_minus_right > 0 ~ "LH > RH",
+      mean_difference_left_minus_right < 0 ~ "RH > LH",
+      TRUE ~ "LH = RH"
+    ),
+    report_sentence = pmap_chr(
+      list(roi_name, metric_label, layer_depth, mean_difference_left_minus_right, df, statistic, p_value, p_fdr),
+      function(roi_name, metric_label, layer_depth, diff, df, statistic, p_value, p_fdr) {
+        if (is.na(p_value)) return(NA_character_)
+        paste0(
+          roi_name, " | ", metric_label, " | ", layer_depth,
+          ": LH-RH = ", fmt_num5(diff),
+          ", t(", fmt_num5(df), ") = ", fmt_num5(statistic),
+          ", p = ", fmt_p5(p_value),
+          ", FDR p = ", fmt_p5(p_fdr), "."
+        )
+      }
+    )
+  ) %>%
+  arrange(value_col, layer_depth, p_fdr, roi_name) %>%
+  add_note(
+    "This table performs the first follow-up for Q1 and Q2: two-tailed Welch independent tests comparing LH parcels with RH parcels within each network and layer-depth category. Each parcel is averaged within a layer depth first, so repeated layers from the same parcel are not treated as independent."
+  )
+
+layer_depth_welch_tests
+```
+
+# 6. Q1 And Q2 Follow-Up: Layer-Depth Permutation Tests
+
+```{r layer-depth-permutation}
+set.seed(PERMUTATION_SEED)
+
+layer_depth_permutation_tests <- purrr::map_dfr(c("delta_mean_r", "srm_mean_r"), function(metric_name) {
+  parcel_layer_depth_df %>%
+    group_by(roi_name, network_family, layer_depth) %>%
+    group_modify(~ safe_permutation_test(.x, value_col = metric_name, group_col = "hemisphere", n_perm = N_PERM_LAYER_DEPTH)) %>%
+    ungroup()
+}) %>%
+  add_grouped_fdr(group_cols = c("value_col", "layer_depth")) %>%
+  mutate(
+    metric_label = recode(value_col, !!!metric_labels),
+    direction = case_when(
+      is.na(mean_difference_left_minus_right) ~ "undefined",
+      mean_difference_left_minus_right > 0 ~ "LH > RH",
+      mean_difference_left_minus_right < 0 ~ "RH > LH",
+      TRUE ~ "LH = RH"
+    )
+  ) %>%
+  arrange(value_col, layer_depth, p_fdr, roi_name) %>%
+  add_note(
+    "This table repeats the layer-depth LH/RH comparison with two-sided label permutations. It is used as the non-parametric robustness check after the Welch tests."
+  )
+
+layer_depth_permutation_tests
+```
+
+# 7. Exploratory Exact-Layer Localization
+
+```{r exact-layer-tests}
+set.seed(PERMUTATION_SEED)
+
+if (RUN_EXACT_LAYER_TESTS) {
+  exact_layer_welch_tests <- purrr::map_dfr(c("delta_mean_r", "srm_mean_r"), function(metric_name) {
+    parcel_layer_df %>%
+      group_by(roi_name, network_family, layer_index, layer_label, layer_depth) %>%
+      group_modify(~ safe_welch_test(.x, value_col = metric_name, group_col = "hemisphere")) %>%
+      ungroup()
+  }) %>%
+    add_grouped_fdr(group_cols = c("value_col", "layer_index")) %>%
+    mutate(
+      metric_label = recode(value_col, !!!metric_labels),
+      direction = case_when(
+        is.na(mean_difference_left_minus_right) ~ "undefined",
+        mean_difference_left_minus_right > 0 ~ "LH > RH",
+        mean_difference_left_minus_right < 0 ~ "RH > LH",
+        TRUE ~ "LH = RH"
+      )
+    ) %>%
+    arrange(value_col, layer_index, p_fdr, roi_name) %>%
+    add_note(
+      "This exploratory table uses Welch tests at each exact GPT-2 layer to localize which layers may drive the broader layer-depth effects. It is multiple-comparison-heavy and should be interpreted as localization rather than the main test."
+    )
+
+  exact_layer_permutation_tests <- purrr::map_dfr(c("delta_mean_r", "srm_mean_r"), function(metric_name) {
+    parcel_layer_df %>%
+      group_by(roi_name, network_family, layer_index, layer_label, layer_depth) %>%
+      group_modify(~ safe_permutation_test(.x, value_col = metric_name, group_col = "hemisphere", n_perm = N_PERM_EXACT_LAYER)) %>%
+      ungroup()
+  }) %>%
+    add_grouped_fdr(group_cols = c("value_col", "layer_index")) %>%
+    mutate(
+      metric_label = recode(value_col, !!!metric_labels),
+      direction = case_when(
+        is.na(mean_difference_left_minus_right) ~ "undefined",
+        mean_difference_left_minus_right > 0 ~ "LH > RH",
+        mean_difference_left_minus_right < 0 ~ "RH > LH",
+        TRUE ~ "LH = RH"
+      )
+    ) %>%
+    arrange(value_col, layer_index, p_fdr, roi_name) %>%
+    add_note(
+      "This exploratory table repeats exact-layer localization with two-sided permutation tests. It provides a robustness check for exact layers identified by Welch tests."
+    )
+} else {
+  exact_layer_welch_tests <- tibble(
+    analysis_note = "Exact-layer Welch tests were skipped. Set RUN_EXACT_LAYER_TESTS <- TRUE to run them."
+  )
+  exact_layer_permutation_tests <- tibble(
+    analysis_note = "Exact-layer permutation tests were skipped. Set RUN_EXACT_LAYER_TESTS <- TRUE to run them."
+  )
+}
+
+exact_layer_welch_tests %>% filter(!is.na(p_fdr), p_fdr < 0.05) %>% head(30)
+exact_layer_permutation_tests %>% filter(!is.na(p_fdr), p_fdr < 0.05) %>% head(30)
+```
+
+# 8. Direction Summaries
+
+```{r direction-summaries}
+layer_depth_direction_summary <- parcel_layer_depth_df %>%
+  group_by(roi_name, network_family, layer_depth, hemisphere) %>%
+  summarise(
+    mean_delta_r = mean(delta_mean_r, na.rm = TRUE),
+    mean_srm_r = mean(srm_mean_r, na.rm = TRUE),
+    n_parcels = n_distinct(parcel_id),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = hemisphere,
+    values_from = c(mean_delta_r, mean_srm_r, n_parcels),
+    names_sep = "_"
+  ) %>%
+  mutate(
+    delta_lh_minus_rh = mean_delta_r_LH - mean_delta_r_RH,
+    srm_lh_minus_rh = mean_srm_r_LH - mean_srm_r_RH,
+    delta_direction = case_when(
+      is.na(delta_lh_minus_rh) ~ "undefined",
+      delta_lh_minus_rh > 0 ~ "LH > RH",
+      delta_lh_minus_rh < 0 ~ "RH > LH",
+      TRUE ~ "LH = RH"
+    ),
+    srm_direction = case_when(
+      is.na(srm_lh_minus_rh) ~ "undefined",
+      srm_lh_minus_rh > 0 ~ "LH > RH",
+      srm_lh_minus_rh < 0 ~ "RH > LH",
+      TRUE ~ "LH = RH"
+    )
+  ) %>%
+  add_note(
+    "This table summarizes the direction of LH/RH differences within each network and layer depth. Positive values mean LH > RH; negative values mean RH > LH."
+  )
+
+network_direction_summary <- layer_depth_direction_summary %>%
+  select(-analysis_note) %>%
+  group_by(roi_name, network_family) %>%
+  summarise(
+    mean_delta_lh_minus_rh_across_depths = mean(delta_lh_minus_rh, na.rm = TRUE),
+    mean_srm_lh_minus_rh_across_depths = mean(srm_lh_minus_rh, na.rm = TRUE),
+    n_delta_lh_biased_depths = sum(delta_lh_minus_rh > 0, na.rm = TRUE),
+    n_delta_rh_biased_depths = sum(delta_lh_minus_rh < 0, na.rm = TRUE),
+    n_depths = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_delta_lh_minus_rh_across_depths)) %>%
+  add_note(
+    "This table compresses the layer-depth direction summary to the network level. It is descriptive and helps interpret whether a network is consistently LH- or RH-biased across layer depth."
+  )
+
+layer_depth_direction_summary
+network_direction_summary
+```
+
+# 9. Figures
+
+```{r figures, fig.width=14, fig.height=7}
+heatmap_df <- layer_depth_permutation_tests %>%
+  filter(value_col %in% c("delta_mean_r", "srm_mean_r")) %>%
+  mutate(
+    metric_label = recode(value_col, !!!metric_labels),
+    roi_name = factor(roi_name, levels = NETWORK_ORDER),
+    layer_depth = factor(layer_depth, levels = layer_depth_order_used)
+  )
+
+max_abs_diff <- max(abs(heatmap_df$mean_difference_left_minus_right), na.rm = TRUE)
+if (!is.finite(max_abs_diff) || max_abs_diff == 0) max_abs_diff <- 1
+
+p_depth_heatmap <- ggplot(heatmap_df, aes(x = layer_depth, y = roi_name, fill = mean_difference_left_minus_right)) +
+  geom_tile(color = "white", linewidth = 0.25) +
+  geom_text(aes(label = ifelse(!is.na(p_fdr) & p_fdr < 0.05, "*", "")), size = 3) +
+  facet_wrap(~ metric_label, nrow = 1) +
+  scale_fill_gradient2(
+    low = "#4575B4",
+    mid = "white",
+    high = "#D73027",
+    midpoint = 0,
+    limits = c(-max_abs_diff, max_abs_diff),
+    name = "LH - RH"
+  ) +
+  labs(
+    title = "Layer-Depth Hemisphere Differences Across Networks",
+    x = "GPT-2 layer depth",
+    y = "Network"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    legend.position = "right",
+    strip.text = element_text(face = "bold")
+  )
+
+p_depth_heatmap
+
+ggsave(
+  filename = file.path(FIGURE_DIR, "layer_depth_lh_rh_mean_difference_heatmap.png"),
+  plot = p_depth_heatmap,
+  width = 14,
+  height = 7,
+  dpi = 300
+)
+
+p_effect_rank <- network_direction_summary %>%
+  select(-analysis_note) %>%
+  mutate(roi_name = fct_reorder(as.character(roi_name), mean_delta_lh_minus_rh_across_depths)) %>%
+  ggplot(aes(x = mean_delta_lh_minus_rh_across_depths, y = roi_name, fill = network_family)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray55") +
+  geom_col(width = 0.72, alpha = 0.9) +
+  labs(
+    title = "Network-Level LH/RH Difference In SRM-Related Gain",
+    x = "Mean gain difference across layer depth (LH - RH)",
+    y = "Network",
+    fill = "Network family"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "right")
+
+p_effect_rank
+
+ggsave(
+  filename = file.path(FIGURE_DIR, "network_delta_lh_rh_effect_size_ranking.png"),
+  plot = p_effect_rank,
+  width = 11,
+  height = 7,
+  dpi = 300
+)
+
+if (exists("layer_model_results") && "F_value" %in% names(layer_model_results)) {
+  model_plot_df <- layer_model_results %>%
+    filter(value_col == "delta_mean_r") %>%
+    mutate(
+      roi_name = factor(roi_name, levels = NETWORK_ORDER),
+      effect_label = factor(
+        effect_label,
+        levels = c("Hemisphere main effect", "Layer depth main effect", "Hemisphere x layer depth interaction")
+      ),
+      neg_log10_fdr = ifelse(is.na(p_fdr), NA_real_, -log10(pmax(p_fdr, 1e-300)))
+    )
+
+  p_model_heatmap <- ggplot(model_plot_df, aes(x = effect_label, y = roi_name, fill = neg_log10_fdr)) +
+    geom_tile(color = "white", linewidth = 0.25) +
+    geom_text(aes(label = significance), size = 3) +
+    scale_fill_viridis_c(option = "magma", na.value = "gray90", name = "-log10(FDR p)") +
+    labs(
+      title = "Mixed-Effects Evidence For Hemisphere And Layer-Depth Effects",
+      x = "Model effect",
+      y = "Network"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1), legend.position = "right")
+
+  p_model_heatmap
+
+  ggsave(
+    filename = file.path(FIGURE_DIR, "network_lmer_effect_fdr_heatmap.png"),
+    plot = p_model_heatmap,
+    width = 11,
+    height = 7,
+    dpi = 300
+  )
+}
+```
+
+# 10. Final FDR-Significant Result Table
+
+```{r final-significant-results}
+model_sig <- if (exists("layer_model_results") && "F_value" %in% names(layer_model_results)) {
+  layer_model_results %>%
+    filter(!is.na(p_fdr), p_fdr < 0.05) %>%
+    transmute(
+      source_table = "network_wise_mixed_effects",
+      analysis_question = model_question,
+      result_type = "F-test",
+      metric = value_col,
+      metric_label,
+      roi_name,
+      network_family,
+      layer_depth = NA_character_,
+      layer_index = NA_integer_,
+      source_effect = effect,
+      effect = effect_label,
+      direction = NA_character_,
+      statistic_name = "F",
+      statistic = F_value,
+      df1 = NumDF,
+      df2 = DenDF,
+      p_value,
+      p_fdr,
+      significance,
+      result_explanation = case_when(
+        source_effect == "hemisphere:scale(log_layer_depth_percent)" ~
+          "The LH/RH difference changes as GPT-2 layer depth changes.",
+        source_effect == "hemisphere" ~
+          "One hemisphere differs from the other after accounting for layer depth.",
+        source_effect == "scale(log_layer_depth_percent)" ~
+          "Encoding changes systematically with GPT-2 layer depth.",
+        TRUE ~ "Significant mixed-effects model result."
+      )
+    )
+} else {
+  tibble()
+}
+
+welch_depth_sig <- layer_depth_welch_tests %>%
+  filter(!is.na(p_fdr), p_fdr < 0.05) %>%
+  transmute(
+    source_table = "layer_depth_welch_tests",
+    analysis_question = case_when(
+      value_col == "srm_mean_r" ~ "Q1",
+      value_col == "delta_mean_r" ~ "Q2",
+      TRUE ~ NA_character_
+    ),
+    result_type = "Welch t-test",
+    metric = value_col,
+    metric_label,
+    roi_name,
+    network_family,
+    layer_depth = as.character(layer_depth),
+    layer_index = NA_integer_,
+    effect = "LH vs RH",
+    direction = case_when(
+      mean_difference_left_minus_right > 0 ~ "LH > RH",
+      mean_difference_left_minus_right < 0 ~ "RH > LH",
+      TRUE ~ "LH = RH"
+    ),
+    statistic_name = "t",
+    statistic,
+    df,
+    df2 = NA_real_,
+    p_value,
+    p_fdr,
+    significance,
+    result_explanation = "Within this network and layer depth, LH and RH parcels differ in the tested encoding outcome."
+  ) %>%
+  rename(df1 = df)
+
+perm_depth_sig <- layer_depth_permutation_tests %>%
+  filter(!is.na(p_fdr), p_fdr < 0.05) %>%
+  transmute(
+    source_table = "layer_depth_permutation_tests",
+    analysis_question = case_when(
+      value_col == "srm_mean_r" ~ "Q1",
+      value_col == "delta_mean_r" ~ "Q2",
+      TRUE ~ NA_character_
+    ),
+    result_type = "Permutation test",
+    metric = value_col,
+    metric_label,
+    roi_name,
+    network_family,
+    layer_depth = as.character(layer_depth),
+    layer_index = NA_integer_,
+    effect = "LH vs RH",
+    direction = case_when(
+      mean_difference_left_minus_right > 0 ~ "LH > RH",
+      mean_difference_left_minus_right < 0 ~ "RH > LH",
+      TRUE ~ "LH = RH"
+    ),
+    statistic_name = "mean difference",
+    statistic = mean_difference_left_minus_right,
+    df1 = NA_real_,
+    df2 = NA_real_,
+    p_value,
+    p_fdr,
+    significance,
+    result_explanation = "Permutation confirms a layer-depth LH/RH difference without relying on Welch t-test assumptions."
+  )
+
+exact_welch_sig <- if (RUN_EXACT_LAYER_TESTS && "p_fdr" %in% names(exact_layer_welch_tests)) {
+  exact_layer_welch_tests %>%
+    filter(!is.na(p_fdr), p_fdr < 0.05) %>%
+    transmute(
+      source_table = "exact_layer_welch_tests",
+      analysis_question = case_when(
+        value_col == "srm_mean_r" ~ "Q1 localization",
+        value_col == "delta_mean_r" ~ "Q2 localization",
+        TRUE ~ NA_character_
+      ),
+      result_type = "Exact-layer Welch t-test",
+      metric = value_col,
+      metric_label,
+      roi_name,
+      network_family,
+      layer_depth = as.character(layer_depth),
+      layer_index,
+      effect = "LH vs RH",
+      direction = case_when(
+        mean_difference_left_minus_right > 0 ~ "LH > RH",
+        mean_difference_left_minus_right < 0 ~ "RH > LH",
+        TRUE ~ "LH = RH"
+      ),
+      statistic_name = "t",
+      statistic,
+      df,
+      df2 = NA_real_,
+      p_value,
+      p_fdr,
+      significance,
+      result_explanation = "Exploratory exact-layer localization; this identifies a specific GPT-2 layer where LH/RH parcels differ."
+    ) %>%
+    rename(df1 = df)
+} else {
+  tibble()
+}
+
+exact_perm_sig <- if (RUN_EXACT_LAYER_TESTS && "p_fdr" %in% names(exact_layer_permutation_tests)) {
+  exact_layer_permutation_tests %>%
+    filter(!is.na(p_fdr), p_fdr < 0.05) %>%
+    transmute(
+      source_table = "exact_layer_permutation_tests",
+      analysis_question = case_when(
+        value_col == "srm_mean_r" ~ "Q1 localization",
+        value_col == "delta_mean_r" ~ "Q2 localization",
+        TRUE ~ NA_character_
+      ),
+      result_type = "Exact-layer permutation test",
+      metric = value_col,
+      metric_label,
+      roi_name,
+      network_family,
+      layer_depth = as.character(layer_depth),
+      layer_index,
+      effect = "LH vs RH",
+      direction = case_when(
+        mean_difference_left_minus_right > 0 ~ "LH > RH",
+        mean_difference_left_minus_right < 0 ~ "RH > LH",
+        TRUE ~ "LH = RH"
+      ),
+      statistic_name = "mean difference",
+      statistic = mean_difference_left_minus_right,
+      df1 = NA_real_,
+      df2 = NA_real_,
+      p_value,
+      p_fdr,
+      significance,
+      result_explanation = "Exploratory exact-layer permutation localization; this is the non-parametric confirmation of an exact-layer LH/RH difference."
+    )
+} else {
+  tibble()
+}
+
+final_fdr_significant_results <- bind_rows(
+  model_sig,
+  welch_depth_sig,
+  perm_depth_sig,
+  exact_welch_sig,
+  exact_perm_sig
+) %>%
+  arrange(source_table, metric, p_fdr, roi_name, layer_index) %>%
+  add_note(
+    "This is the final summary table requested for reporting. It contains every result in this Rmd that survives FDR correction, along with a short explanation of what that result means."
+  )
+
+final_fdr_significant_results
+```
+
+# 11. Save Organized Workbook
+
+```{r save-workbook}
+table_notes <- tribble(
+  ~sheet_name, ~analysis_question, ~what_this_sheet_does, ~why_it_matters,
+  "00_README", "All questions",
+  "Explains each sheet in the workbook and how the analyses map onto the three hemisphere questions.",
+  "This is the first sheet so the workbook can be read without opening the Rmd.",
+  "01_input_sanity", "Input validation",
+  "Checks the number of parcel-layer rows, parcels, networks, layers, and layer-depth categories.",
+  "This confirms that the statistical tests are based on the expected data structure.",
+  "02_question_map", "All questions",
+  "Defines Q1, Q2, and Q3 and links each question to its primary metric and statistical test.",
+  "This keeps the analysis order aligned with the manuscript logic.",
+  "03_outcome_definitions", "All questions",
+  "Defines raw_mean_r, srm_mean_r, and delta_mean_r.",
+  "This prevents ambiguity about what each encoding outcome means.",
+  "04_hemisphere_counts", "Input validation",
+  "Reports LH/RH parcel counts in each network.",
+  "This helps interpret Welch and permutation tests when networks have unequal hemisphere parcel counts.",
+  "05_profile_values", "Q1 and Q2",
+  "Averages raw, SRM, and delta encoding values by network, hemisphere, and layer.",
+  "This supports the layer-profile figures and provides descriptive values.",
+  "06_mixed_models", "Q3",
+  "Tests hemisphere, layer depth, and hemisphere-by-layer-depth effects within each network using mixed-effects models.",
+  "This is the main model-based evidence for whether LH/RH effects change with GPT-2 layer depth.",
+  "07_layer_depth_welch", "Q1 and Q2",
+  "Compares LH and RH parcels within each network and layer-depth category using Welch tests.",
+  "This is the first follow-up test for specific layer-depth categories.",
+  "08_layer_depth_permutation", "Q1 and Q2",
+  "Repeats the layer-depth LH/RH tests with label permutations.",
+  "This provides a non-parametric robustness check after Welch tests.",
+  "09_exact_layer_welch", "Q1/Q2 localization",
+  "Exploratory Welch tests at each exact GPT-2 layer.",
+  "This can localize which exact layers drive broader layer-depth effects.",
+  "10_exact_layer_permutation", "Q1/Q2 localization",
+  "Exploratory exact-layer permutation tests.",
+  "This provides a non-parametric check for exact-layer localization.",
+  "11_direction_summary", "Q1 and Q2",
+  "Summarizes LH-RH direction across layer depth for each network.",
+  "This helps describe whether a network is consistently LH- or RH-biased.",
+  "12_final_FDR_results", "Final reporting",
+  "Lists all FDR-significant results from mixed models, layer-depth tests, and exact-layer localization.",
+  "This is the main report-ready summary table."
+)
+
+workbook_path <- file.path(TABLE_DIR, "final_r_test_organized_layerwise_hemisphere_results.xlsx")
+
+writexl::write_xlsx(
+  list(
+    `00_README` = table_notes,
+    `01_input_sanity` = input_sanity_summary,
+    `02_question_map` = question_table,
+    `03_outcome_definitions` = outcome_definition,
+    `04_hemisphere_counts` = hemisphere_counts,
+    `05_profile_values` = profile_df,
+    `06_mixed_models` = layer_model_results,
+    `07_layer_depth_welch` = layer_depth_welch_tests,
+    `08_layer_depth_permutation` = layer_depth_permutation_tests,
+    `09_exact_layer_welch` = exact_layer_welch_tests,
+    `10_exact_layer_permutation` = exact_layer_permutation_tests,
+    `11_layer_depth_direction` = layer_depth_direction_summary,
+    `11_network_direction` = network_direction_summary,
+    `12_final_FDR_results` = final_fdr_significant_results
+  ),
+  workbook_path
+)
+
+cat("\nFinal organized R analysis completed.\n")
+cat("Workbook saved to:", workbook_path, "\n")
+cat("Figures saved to:", FIGURE_DIR, "\n")
+cat("Number of FDR-significant rows in final table:", nrow(final_fdr_significant_results), "\n")
+```
+
+# Interpretation Notes
+
+- Positive `LH - RH` means the left hemisphere has larger values than the right hemisphere.
+- `delta_mean_r` is the main SRM-related improvement measure: SRM+LLM encoding r minus Raw+LLM encoding r.
+- `srm_mean_r` answers whether final SRM+LLM encoding is stronger in one hemisphere.
+- `layer depth` refers to the GPT-2 representational depth category: embedding, early, early-middle, middle-late, or late.
+- Welch tests are always reported before permutation tests.
+- Mixed-effects models are the main analysis for whether hemisphere effects change continuously with GPT-2 layer depth.

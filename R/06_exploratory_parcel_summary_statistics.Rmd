@@ -1,0 +1,726 @@
+﻿---
+title: "SNL Layer-Wise SRM+LLM Follow-Up Statistics"
+author: "Analysis draft"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+options(scipen = 999)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 11, fig.height = 7, dpi = 300)
+
+required_packages <- c("tidyverse", "broom", "knitr")
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(paste0("Required R package is missing: ", pkg))
+  }
+}
+
+library(tidyverse)
+library(broom)
+library(knitr)
+
+has_lme4 <- requireNamespace("lme4", quietly = TRUE)
+has_lmerTest <- requireNamespace("lmerTest", quietly = TRUE)
+has_writexl <- requireNamespace("writexl", quietly = TRUE)
+has_openxlsx <- requireNamespace("openxlsx", quietly = TRUE)
+
+BASE_DIR <- "YOUR_PROJECT_ROOT"
+RUN_DIR <- file.path(BASE_DIR, "SNL_layerwise_encoding_fixed_srm50")
+SRM_RUN_DIR <- "YOUR_SNL2026_ROOT/runs"
+STEP9_CSV_DIR <- file.path(RUN_DIR, "step9_raw_vs_srm_layerwise_encoding_comparison", "csv")
+STEP11G_CSV_DIR <- file.path(BASE_DIR, "parcel_layer_network_outputs", "step11G_final_parcel_level_summary", "csv")
+STEP11E_CSV_DIR <- file.path(BASE_DIR, "parcel_layer_network_outputs", "step11E_within_network_heterogeneity", "csv")
+STEP11F_CSV_DIR <- file.path(BASE_DIR, "parcel_layer_network_outputs", "step11F_spatial_gradient_analysis", "csv")
+
+OUT_DIR <- file.path(BASE_DIR, "r_outputs")
+TABLE_DIR <- file.path(OUT_DIR, "tables")
+FIGURE_DIR <- file.path(OUT_DIR, "figures")
+dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURE_DIR, recursive = TRUE, showWarnings = FALSE)
+
+NETWORK_ORDER <- c(
+  "VisCent", "VisPeri", "SomMotA", "SomMotB", "DorsAttnA", "DorsAttnB",
+  "SalVentAttnA", "SalVentAttnB", "LimbicA", "LimbicB",
+  "ContA", "ContB", "ContC", "DefaultA", "DefaultB", "DefaultC", "TempPar"
+)
+
+FAMILY_COLORS <- c(
+  "Visual" = "#E66101",
+  "SomMot" = "#1F9AC2",
+  "DorsAttn" = "#5E3C99",
+  "SalVentAttn" = "#B2ABD2",
+  "Control" = "#2CA25F",
+  "Default" = "#1B7837",
+  "Limbic" = "#DD1C77",
+  "TempPar" = "#E7298A"
+)
+
+read_csv_safe <- function(path) {
+  if (!file.exists(path)) stop(paste("Missing file:", path))
+  readr::read_csv(path, show_col_types = FALSE)
+}
+
+fmt_num <- function(x, digits = 5) {
+  ifelse(is.na(x), NA_character_, formatC(as.numeric(x), format = "f", digits = digits))
+}
+
+fmt_p <- function(p, digits = 5) {
+  ifelse(
+    is.na(p), NA_character_,
+    ifelse(p < 10^(-digits), paste0("<", formatC(10^(-digits), format = "f", digits = digits)),
+           formatC(p, format = "f", digits = digits))
+  )
+}
+
+sig_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "NA",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+write_table_safe <- function(df, name) {
+  csv_path <- file.path(TABLE_DIR, paste0(name, ".csv"))
+  readr::write_excel_csv(df, csv_path)
+  csv_path
+}
+
+write_xlsx_safe <- function(named_list, filename) {
+  xlsx_path <- file.path(TABLE_DIR, filename)
+  if (has_writexl) {
+    writexl::write_xlsx(named_list, xlsx_path)
+    return(xlsx_path)
+  }
+  if (has_openxlsx) {
+    openxlsx::write.xlsx(named_list, xlsx_path, overwrite = TRUE)
+    return(xlsx_path)
+  }
+  message("No writexl/openxlsx package found; xlsx export skipped: ", xlsx_path)
+  return(NA_character_)
+}
+
+save_plot <- function(plot, filename, width = 11, height = 7) {
+  path <- file.path(FIGURE_DIR, filename)
+  ggplot2::ggsave(path, plot, width = width, height = height, dpi = 300, bg = "white")
+  path
+}
+
+make_layer_depth_percent <- function(layer_index) {
+  # Embedding layer is 0; transformer layers are 1-48. This mirrors the log-depth interpretation used in brain maps.
+  x <- pmax(as.numeric(layer_index), 1)
+  100 * log1p(x) / log1p(48)
+}
+
+assign_depth_bin <- function(depth_percent) {
+  cut(
+    depth_percent,
+    breaks = c(-Inf, 50, 72, 90, Inf),
+    labels = c("early", "early-middle", "middle-late", "late"),
+    right = FALSE
+  )
+}
+```
+
+# 1. Load Existing Results
+
+This file only summarizes existing outputs. It does not refit SRM, GPT-2 features, ridge models, or brain maps.
+
+```{r load-data}
+group_layer_df <- read_csv_safe(file.path(STEP9_CSV_DIR, "step9_group_raw_vs_srm_layerwise_comparison.csv"))
+subject_layer_df <- read_csv_safe(file.path(STEP9_CSV_DIR, "step9_subject_level_raw_vs_srm_layerwise_comparison.csv"))
+subject_paired_tests_df <- read_csv_safe(file.path(STEP9_CSV_DIR, "step9_subject_level_paired_tests_by_network_layer.csv"))
+best_layer_df <- read_csv_safe(file.path(STEP9_CSV_DIR, "step9_network_best_layer_raw_vs_srm_comparison.csv"))
+
+network_summary_df <- read_csv_safe(file.path(STEP11G_CSV_DIR, "step11G_final_network_summary_table.csv"))
+parcel_df <- read_csv_safe(file.path(STEP11G_CSV_DIR, "step11G_final_parcel_level_table.csv"))
+network_ranking_df <- read_csv_safe(file.path(STEP11G_CSV_DIR, "step11G_network_ranking_summary.csv"))
+step11_stats_df <- read_csv_safe(file.path(STEP11G_CSV_DIR, "step11G_statistical_followup_tests.csv"))
+top_parcels_by_r_df <- read_csv_safe(file.path(STEP11G_CSV_DIR, "step11G_top_parcels_by_best_srm_r.csv"))
+top_parcels_by_gain_df <- read_csv_safe(file.path(STEP11G_CSV_DIR, "step11G_top_parcels_by_same_layer_gain.csv"))
+heterogeneity_df <- read_csv_safe(file.path(STEP11E_CSV_DIR, "step11E_network_within_network_heterogeneity_summary.csv"))
+spatial_axis_df <- read_csv_safe(file.path(STEP11F_CSV_DIR, "step11F_network_best_single_axis_gradients.csv"))
+spatial_model_df <- read_csv_safe(file.path(STEP11F_CSV_DIR, "step11F_network_best_spatial_gradient_models.csv"))
+
+for (obj_name in c("group_layer_df", "subject_layer_df", "network_summary_df", "parcel_df")) {
+  obj <- get(obj_name)
+  if ("roi_name" %in% names(obj)) {
+    obj$roi_name <- factor(obj$roi_name, levels = NETWORK_ORDER)
+    assign(obj_name, obj)
+  }
+}
+
+group_layer_df <- group_layer_df %>%
+  mutate(
+    layer_index = as.integer(layer_index),
+    layer_depth_percent = make_layer_depth_percent(layer_index),
+    depth_bin = assign_depth_bin(layer_depth_percent),
+    roi_name = factor(roi_name, levels = NETWORK_ORDER)
+  )
+
+subject_layer_df <- subject_layer_df %>%
+  mutate(
+    layer_index = as.integer(layer_index),
+    layer_depth_percent = make_layer_depth_percent(layer_index),
+    depth_bin = assign_depth_bin(layer_depth_percent),
+    roi_name = factor(roi_name, levels = NETWORK_ORDER)
+  )
+
+network_summary_df <- network_summary_df %>% mutate(roi_name = factor(roi_name, levels = NETWORK_ORDER))
+parcel_df <- parcel_df %>% mutate(roi_name = factor(roi_name, levels = NETWORK_ORDER))
+
+loaded_summary <- tibble::tibble(
+  table = c("group_layer_df", "subject_layer_df", "subject_paired_tests_df", "best_layer_df", "network_summary_df", "parcel_df"),
+  n_rows = c(nrow(group_layer_df), nrow(subject_layer_df), nrow(subject_paired_tests_df), nrow(best_layer_df), nrow(network_summary_df), nrow(parcel_df)),
+  n_columns = c(ncol(group_layer_df), ncol(subject_layer_df), ncol(subject_paired_tests_df), ncol(best_layer_df), ncol(network_summary_df), ncol(parcel_df))
+)
+
+kable(loaded_summary, caption = "Loaded result tables used in this R follow-up.")
+```
+
+# 2. SRM-Only Alignment Summary
+
+This section uses the existing Step 4 time-segment classification summaries. It asks whether SRM alignment improved between-subject matching before any GPT-2 encoding model was fit.
+
+```{r srm-tsc-summary}
+step4_files <- list.files(
+  SRM_RUN_DIR,
+  pattern = "step4_summary.csv$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+tsc_summary_df <- purrr::map_dfr(step4_files, function(path) {
+  roi <- basename(dirname(dirname(dirname(path)))) %>% stringr::str_remove("_400_parcels_fixed_srm50$")
+  readr::read_csv(path, show_col_types = FALSE) %>%
+    mutate(roi_name = roi, .before = 1)
+}) %>%
+  mutate(
+    roi_name = factor(roi_name, levels = NETWORK_ORDER),
+    delta_mean_shared_minus_anat = shared_mean - anat_mean
+  ) %>%
+  arrange(desc(delta_mean_shared_minus_anat))
+
+tsc_display <- tsc_summary_df %>%
+  transmute(
+    roi_name,
+    n_subjects,
+    chance = fmt_num(chance),
+    anatomical_mean = fmt_num(anat_mean),
+    srm_mean = fmt_num(shared_mean),
+    delta_srm_minus_anatomical = fmt_num(delta_mean_shared_minus_anat),
+    subject_fraction_srm_better = fmt_num(subject_fraction_shared_better),
+    features
+  )
+
+write_table_safe(tsc_summary_df, "srm_step4_time_segment_classification_summary")
+kable(tsc_display, caption = "SRM-only Step 4 time-segment classification summary.")
+```
+
+```{r fig-tsc-ranking}
+p_tsc <- tsc_summary_df %>%
+  mutate(roi_name = fct_reorder(roi_name, delta_mean_shared_minus_anat)) %>%
+  ggplot(aes(x = delta_mean_shared_minus_anat, y = roi_name, fill = delta_mean_shared_minus_anat)) +
+  geom_col(width = 0.75) +
+  scale_fill_gradient(low = "#D9EAF7", high = "#08519C") +
+  scale_x_continuous(labels = scales::label_number(accuracy = 0.01)) +
+  labs(
+    title = "SRM Improves Between-Subject Time-Segment Classification",
+    x = "Mean accuracy gain: SRM - anatomical alignment",
+    y = "Network",
+    fill = "Gain"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "right")
+
+p_tsc
+save_plot(p_tsc, "r_step2_srm_time_segment_classification_gain.png", width = 10, height = 7)
+```
+
+# 3. Layer-Wise GPT-2 Encoding: Raw vs SRM
+
+This section asks whether SRM-reconstructed responses are more predictable from GPT-2 XL layer-wise representations than raw anatomically aligned responses.
+
+```{r group-layer-statistics}
+group_long_df <- group_layer_df %>%
+  select(roi_name, layer_label, layer_index, layer_depth_percent, depth_bin,
+         raw_group_mean_r, srm_group_mean_r, delta_group_mean_r_srm_minus_raw) %>%
+  pivot_longer(
+    cols = c(raw_group_mean_r, srm_group_mean_r),
+    names_to = "target",
+    values_to = "mean_r"
+  ) %>%
+  mutate(
+    target = recode(target, raw_group_mean_r = "Raw + LLM", srm_group_mean_r = "SRM + LLM")
+  )
+
+group_paired_test <- group_layer_df %>%
+  summarise(
+    n_network_layer_pairs = n(),
+    mean_raw = mean(raw_group_mean_r, na.rm = TRUE),
+    mean_srm = mean(srm_group_mean_r, na.rm = TRUE),
+    mean_delta = mean(delta_group_mean_r_srm_minus_raw, na.rm = TRUE),
+    median_delta = median(delta_group_mean_r_srm_minus_raw, na.rm = TRUE),
+    positive_pair_fraction = mean(delta_group_mean_r_srm_minus_raw > 0, na.rm = TRUE),
+    paired_t = list(t.test(srm_group_mean_r, raw_group_mean_r, paired = TRUE)),
+    paired_wilcox = list(wilcox.test(srm_group_mean_r, raw_group_mean_r, paired = TRUE, exact = FALSE))
+  ) %>%
+  mutate(
+    t_statistic = map_dbl(paired_t, ~ unname(.x$statistic)),
+    t_p_value = map_dbl(paired_t, ~ .x$p.value),
+    wilcox_statistic = map_dbl(paired_wilcox, ~ unname(.x$statistic)),
+    wilcox_p_value = map_dbl(paired_wilcox, ~ .x$p.value)
+  ) %>%
+  select(-paired_t, -paired_wilcox)
+
+group_paired_display <- group_paired_test %>%
+  mutate(across(where(is.numeric), ~ fmt_num(.x))) %>%
+  mutate(
+    t_p_value = fmt_p(as.numeric(t_p_value)),
+    wilcox_p_value = fmt_p(as.numeric(wilcox_p_value))
+  )
+
+write_table_safe(group_paired_test, "group_layerwise_raw_vs_srm_paired_summary")
+kable(group_paired_display, caption = "Group-level paired comparison across all network-layer pairs. Treat as descriptive because network-layer pairs are not fully independent observations.")
+```
+
+```{r layer-depth-bin-summary}
+depth_bin_summary_df <- group_layer_df %>%
+  group_by(depth_bin) %>%
+  summarise(
+    n_pairs = n(),
+    mean_raw = mean(raw_group_mean_r, na.rm = TRUE),
+    mean_srm = mean(srm_group_mean_r, na.rm = TRUE),
+    mean_delta = mean(delta_group_mean_r_srm_minus_raw, na.rm = TRUE),
+    median_delta = median(delta_group_mean_r_srm_minus_raw, na.rm = TRUE),
+    positive_pair_fraction = mean(delta_group_mean_r_srm_minus_raw > 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_table_safe(depth_bin_summary_df, "group_layerwise_depth_bin_summary")
+kable(depth_bin_summary_df %>% mutate(across(where(is.numeric), fmt_num)), caption = "Group-level SRM gain summarized by log-scaled GPT-2 layer-depth bin.")
+```
+
+```{r fig-group-layer-profiles}
+y_lim <- range(c(group_layer_df$raw_group_mean_r, group_layer_df$srm_group_mean_r), na.rm = TRUE)
+
+p_group_profiles <- group_long_df %>%
+  ggplot(aes(x = layer_index, y = mean_r, color = roi_name, group = roi_name)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray55") +
+  geom_line(linewidth = 0.7, alpha = 0.9) +
+  facet_wrap(~ target, nrow = 1) +
+  coord_cartesian(ylim = y_lim) +
+  labs(
+    title = "Layer-Wise GPT-2 Encoding Profiles",
+    x = "GPT-2 representation index (0 = embedding; 1-48 = transformer layers)",
+    y = "Group-level mean held-out encoding r",
+    color = "Network"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "right")
+
+p_group_profiles
+save_plot(p_group_profiles, "r_step3_group_layerwise_profiles_raw_vs_srm.png", width = 14, height = 7)
+```
+
+```{r fig-group-heatmap}
+heat_df <- group_long_df %>%
+  mutate(roi_name = factor(roi_name, levels = rev(NETWORK_ORDER)))
+
+p_heat <- heat_df %>%
+  ggplot(aes(x = layer_index, y = roi_name, fill = mean_r)) +
+  geom_tile() +
+  facet_wrap(~ target, nrow = 1) +
+  scale_fill_viridis_c(option = "C", limits = range(heat_df$mean_r, na.rm = TRUE)) +
+  labs(
+    title = "Unified-Scale Raw+LLM vs SRM+LLM Encoding Heatmaps",
+    x = "GPT-2 representation index",
+    y = "Network",
+    fill = "Mean r"
+  ) +
+  theme_bw(base_size = 12)
+
+p_heat
+save_plot(p_heat, "r_step3_group_layerwise_heatmaps_raw_vs_srm.png", width = 13, height = 8)
+```
+
+# 4. Subject-Level Layer-Wise SRM Gain
+
+This section uses the existing subject-level encoding table. It asks whether the SRM gain is present at the participant level rather than only in group-average maps.
+
+```{r subject-layer-model}
+subject_delta_df <- subject_layer_df %>%
+  select(roi_name, layer_label, layer_index, layer_depth_percent, depth_bin, subject_index,
+         raw_subject_mean_r, srm_subject_mean_r, delta_subject_mean_r_srm_minus_raw) %>%
+  filter(!is.na(delta_subject_mean_r_srm_minus_raw)) %>%
+  mutate(
+    roi_name = factor(roi_name, levels = NETWORK_ORDER),
+    subject_index = factor(subject_index)
+  )
+
+subject_overall_summary <- subject_delta_df %>%
+  summarise(
+    n_observations = n(),
+    n_subjects = n_distinct(subject_index),
+    n_networks = n_distinct(roi_name),
+    mean_raw = mean(raw_subject_mean_r, na.rm = TRUE),
+    mean_srm = mean(srm_subject_mean_r, na.rm = TRUE),
+    mean_delta = mean(delta_subject_mean_r_srm_minus_raw, na.rm = TRUE),
+    median_delta = median(delta_subject_mean_r_srm_minus_raw, na.rm = TRUE),
+    positive_observation_fraction = mean(delta_subject_mean_r_srm_minus_raw > 0, na.rm = TRUE)
+  )
+
+if (has_lmerTest) {
+  subject_model <- lmerTest::lmer(delta_subject_mean_r_srm_minus_raw ~ scale(layer_index) * roi_name + (1 | subject_index), data = subject_delta_df)
+  subject_model_table <- broom::tidy(anova(subject_model)) %>% mutate(term = rownames(anova(subject_model)), .before = 1)
+} else if (has_lme4) {
+  subject_model <- lme4::lmer(delta_subject_mean_r_srm_minus_raw ~ scale(layer_index) * roi_name + (1 | subject_index), data = subject_delta_df)
+  subject_model_table <- broom::tidy(subject_model)
+} else {
+  subject_model <- lm(delta_subject_mean_r_srm_minus_raw ~ scale(layer_index) * roi_name + subject_index, data = subject_delta_df)
+  subject_model_table <- broom::tidy(subject_model)
+}
+
+write_table_safe(subject_overall_summary, "subject_level_overall_srm_gain_summary")
+write_table_safe(subject_model_table, "subject_level_delta_model_table")
+
+kable(subject_overall_summary %>% mutate(across(where(is.numeric), fmt_num)), caption = "Subject-level SRM gain summary across network-layer observations.")
+kable(head(subject_model_table, 20), caption = "Model summary for subject-level SRM gain. Uses lmerTest/lme4 if available, otherwise subject fixed effects in lm.")
+```
+
+```{r subject-best-layer-summary}
+subject_best_by_network <- subject_delta_df %>%
+  group_by(roi_name, layer_index, layer_label, depth_bin) %>%
+  summarise(
+    mean_raw = mean(raw_subject_mean_r, na.rm = TRUE),
+    mean_srm = mean(srm_subject_mean_r, na.rm = TRUE),
+    mean_delta = mean(delta_subject_mean_r_srm_minus_raw, na.rm = TRUE),
+    positive_subject_fraction = mean(delta_subject_mean_r_srm_minus_raw > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(roi_name) %>%
+  slice_max(mean_srm, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(desc(mean_srm))
+
+write_table_safe(subject_best_by_network, "subject_level_best_layer_by_network")
+kable(subject_best_by_network %>% mutate(across(where(is.numeric), fmt_num)), caption = "Participant-level best SRM+LLM layer by network.")
+```
+
+```{r fig-subject-delta-depth}
+p_subject_depth <- subject_delta_df %>%
+  group_by(roi_name, depth_bin) %>%
+  summarise(
+    mean_delta = mean(delta_subject_mean_r_srm_minus_raw, na.rm = TRUE),
+    se_delta = sd(delta_subject_mean_r_srm_minus_raw, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = depth_bin, y = mean_delta, fill = depth_bin)) +
+  geom_col(width = 0.75) +
+  geom_errorbar(aes(ymin = mean_delta - se_delta, ymax = mean_delta + se_delta), width = 0.2) +
+  facet_wrap(~ roi_name, scales = "fixed") +
+  scale_fill_brewer(palette = "YlOrRd") +
+  labs(
+    title = "Subject-Level SRM Gain By GPT-2 Layer-Depth Bin",
+    x = "Log-scaled layer-depth bin",
+    y = "Mean participant-level gain: SRM+LLM - Raw+LLM"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1), legend.position = "none")
+
+p_subject_depth
+save_plot(p_subject_depth, "r_step4_subject_level_delta_by_depth_bin.png", width = 14, height = 10)
+```
+
+# 5. Parcel-Level Hotspots And SRM Gain
+
+This section asks which specific Schaefer parcels drive the network-level layer-wise profiles. This is the main analysis that goes beyond the Step 9 line plot.
+
+```{r parcel-hotspot-tables}
+hotspot_by_r_display <- top_parcels_by_r_df %>%
+  select(parcel_id, parcel_label, roi_name, network_family, best_srm_layer_index,
+         best_srm_log_depth_percent, best_srm_r, same_layer_gain, contextual_minus_early_gain,
+         srm_preferred_layer_confidence) %>%
+  mutate(across(where(is.numeric), fmt_num))
+
+hotspot_by_gain_display <- top_parcels_by_gain_df %>%
+  select(parcel_id, parcel_label, roi_name, network_family, best_srm_layer_index,
+         best_srm_log_depth_percent, best_srm_r, same_layer_gain, contextual_minus_early_gain,
+         srm_preferred_layer_confidence) %>%
+  mutate(across(where(is.numeric), fmt_num))
+
+kable(head(hotspot_by_r_display, 15), caption = "Top parcels by best SRM+LLM encoding r.")
+kable(head(hotspot_by_gain_display, 15), caption = "Top parcels by same-layer SRM gain.")
+```
+
+```{r parcel-level-statistics}
+parcel_kw_tests <- list(
+  best_srm_r_by_network = kruskal.test(best_srm_r ~ roi_name, data = parcel_df),
+  same_layer_gain_by_network = kruskal.test(same_layer_gain ~ roi_name, data = parcel_df),
+  depth_by_network = kruskal.test(best_srm_log_depth_percent ~ roi_name, data = parcel_df),
+  contextual_minus_early_gain_by_network = kruskal.test(contextual_minus_early_gain ~ roi_name, data = parcel_df),
+  best_srm_r_by_family = kruskal.test(best_srm_r ~ network_family, data = parcel_df),
+  same_layer_gain_by_family = kruskal.test(same_layer_gain ~ network_family, data = parcel_df),
+  depth_by_family = kruskal.test(best_srm_log_depth_percent ~ network_family, data = parcel_df),
+  contextual_minus_early_gain_by_family = kruskal.test(contextual_minus_early_gain ~ network_family, data = parcel_df)
+)
+
+parcel_kw_df <- purrr::imap_dfr(parcel_kw_tests, function(test, name) {
+  tibble(
+    test_name = name,
+    statistic = unname(test$statistic),
+    parameter = unname(test$parameter),
+    p_value = test$p.value
+  )
+}) %>%
+  mutate(
+    p_fdr = p.adjust(p_value, method = "BH"),
+    p_value_print = fmt_p(p_value),
+    p_fdr_print = fmt_p(p_fdr),
+    significance_fdr = sig_stars(p_fdr)
+  ) %>%
+  arrange(p_fdr)
+
+parcel_cor_df <- tibble(
+  pair = c(
+    "best_srm_r vs same_layer_gain",
+    "best_srm_r vs contextual_minus_early_gain",
+    "same_layer_gain vs contextual_minus_early_gain",
+    "best_srm_log_depth_percent vs same_layer_gain",
+    "best_srm_log_depth_percent vs best_srm_r"
+  ),
+  x = c("best_srm_r", "best_srm_r", "same_layer_gain", "best_srm_log_depth_percent", "best_srm_log_depth_percent"),
+  y = c("same_layer_gain", "contextual_minus_early_gain", "contextual_minus_early_gain", "same_layer_gain", "best_srm_r")
+) %>%
+  mutate(
+    test = purrr::map2(x, y, ~ cor.test(parcel_df[[.x]], parcel_df[[.y]], method = "spearman", exact = FALSE)),
+    rho = purrr::map_dbl(test, ~ unname(.x$estimate)),
+    p_value = purrr::map_dbl(test, ~ .x$p.value),
+    p_fdr = p.adjust(p_value, method = "BH"),
+    p_value_print = fmt_p(p_value),
+    p_fdr_print = fmt_p(p_fdr),
+    significance_fdr = sig_stars(p_fdr)
+  ) %>%
+  select(-test)
+
+write_table_safe(parcel_kw_df, "parcel_level_kruskal_tests")
+write_table_safe(parcel_cor_df, "parcel_level_spearman_correlations")
+
+kable(parcel_kw_df %>% mutate(across(c(statistic), fmt_num)), caption = "Parcel-level Kruskal-Wallis tests.")
+kable(parcel_cor_df %>% mutate(rho = fmt_num(rho)), caption = "Parcel-level Spearman correlations.")
+```
+
+```{r fig-parcel-hotspots}
+p_hotspot_gain <- top_parcels_by_gain_df %>%
+  slice_head(n = 20) %>%
+  mutate(parcel_label_short = stringr::str_replace(parcel_label, "17Networks_", ""),
+         parcel_label_short = fct_reorder(parcel_label_short, same_layer_gain)) %>%
+  ggplot(aes(x = same_layer_gain, y = parcel_label_short, fill = network_family)) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = FAMILY_COLORS, na.value = "gray70") +
+  labs(
+    title = "Top Parcel Hotspots By Same-Layer SRM Gain",
+    x = "Same-layer SRM gain",
+    y = "Parcel",
+    fill = "Network family"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "right")
+
+p_hotspot_gain
+save_plot(p_hotspot_gain, "r_step5_top_parcels_by_same_layer_gain.png", width = 12, height = 8)
+```
+
+```{r fig-parcel-r-gain-scatter}
+p_r_gain <- parcel_df %>%
+  ggplot(aes(x = best_srm_r, y = same_layer_gain, color = network_family)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray55") +
+  geom_point(alpha = 0.75, size = 2.1) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.7) +
+  scale_color_manual(values = FAMILY_COLORS, na.value = "gray70") +
+  labs(
+    title = "Parcels With Stronger SRM+LLM Encoding Also Show Larger SRM Gain",
+    x = "Best SRM+LLM encoding r",
+    y = "Same-layer SRM gain",
+    color = "Network family"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "right")
+
+p_r_gain
+save_plot(p_r_gain, "r_step5_parcel_best_srm_r_vs_same_layer_gain.png", width = 10, height = 7)
+```
+
+# 6. Within-Network Heterogeneity
+
+This section asks whether each network-level line in Step 9 is internally coherent or whether it hides parcel-level variability.
+
+```{r heterogeneity-summary}
+heterogeneity_summary_df <- heterogeneity_df %>%
+  mutate(roi_name = factor(roi_name, levels = NETWORK_ORDER)) %>%
+  arrange(desc(sd_preferred_depth))
+
+heterogeneity_display <- heterogeneity_summary_df %>%
+  select(roi_name, network_family, n_parcels, mean_preferred_depth, sd_preferred_depth,
+         iqr_preferred_depth, range_preferred_depth, heterogeneity_index,
+         early_parcel_proportion, early_middle_parcel_proportion, middle_late_parcel_proportion, late_parcel_proportion) %>%
+  mutate(across(where(is.numeric), fmt_num))
+
+write_table_safe(heterogeneity_summary_df, "within_network_heterogeneity_summary")
+kable(heterogeneity_display, caption = "Within-network heterogeneity of parcel preferred GPT-2 layer depth.")
+```
+
+```{r fig-heterogeneity-ranking}
+p_hetero <- heterogeneity_summary_df %>%
+  mutate(roi_name = fct_reorder(roi_name, sd_preferred_depth)) %>%
+  ggplot(aes(x = sd_preferred_depth, y = roi_name, fill = network_family)) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = FAMILY_COLORS, na.value = "gray70") +
+  labs(
+    title = "Networks Differ In Parcel-Level Preferred-Layer Heterogeneity",
+    x = "SD of preferred layer depth across parcels",
+    y = "Network",
+    fill = "Network family"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "right")
+
+p_hetero
+save_plot(p_hetero, "r_step6_within_network_heterogeneity_ranking.png", width = 10, height = 7)
+```
+
+```{r heterogeneity-vs-strength}
+heterogeneity_strength_df <- network_summary_df %>%
+  select(roi_name, network_family, mean_best_srm_r, mean_same_layer_gain) %>%
+  left_join(heterogeneity_summary_df %>% select(roi_name, sd_preferred_depth, heterogeneity_index), by = "roi_name")
+
+heterogeneity_cor_tests <- tibble(
+  pair = c("mean_best_srm_r vs sd_preferred_depth", "mean_same_layer_gain vs sd_preferred_depth"),
+  x = c("mean_best_srm_r", "mean_same_layer_gain"),
+  y = c("sd_preferred_depth", "sd_preferred_depth")
+) %>%
+  mutate(
+    test = purrr::map2(x, y, ~ cor.test(heterogeneity_strength_df[[.x]], heterogeneity_strength_df[[.y]], method = "spearman", exact = FALSE)),
+    rho = purrr::map_dbl(test, ~ unname(.x$estimate)),
+    p_value = purrr::map_dbl(test, ~ .x$p.value),
+    p_value_print = fmt_p(p_value)
+  ) %>%
+  select(-test)
+
+write_table_safe(heterogeneity_cor_tests, "network_heterogeneity_vs_encoding_strength_correlations")
+kable(heterogeneity_cor_tests %>% mutate(rho = fmt_num(rho)), caption = "Exploratory correlations between network encoding strength and preferred-depth heterogeneity.")
+```
+
+# 7. Exploratory Spatial Gradient Analysis
+
+This section uses Step 11F outputs. It should be treated as exploratory. The main stable result is DefaultA medial-lateral organization; most other networks do not survive correction.
+
+```{r spatial-gradient-summary}
+spatial_axis_display <- spatial_axis_df %>%
+  filter(target == "best_srm_log_depth_percent") %>%
+  arrange(p_fdr_within_target_axis_tests) %>%
+  select(analysis_set, roi_name, network_family, axis_name, n_parcels, r, p_value, p_fdr_within_target_axis_tests) %>%
+  mutate(
+    r = fmt_num(r),
+    p_value = fmt_p(p_value),
+    p_fdr_within_target_axis_tests = fmt_p(p_fdr_within_target_axis_tests)
+  )
+
+write_table_safe(spatial_axis_df, "spatial_axis_gradient_results")
+kable(head(spatial_axis_display, 20), caption = "Best single-axis spatial gradients for preferred layer depth. Exploratory follow-up.")
+```
+
+```{r fig-spatial-gradient}
+p_spatial <- spatial_axis_df %>%
+  filter(target == "best_srm_log_depth_percent") %>%
+  mutate(roi_name = fct_reorder(roi_name, abs(r))) %>%
+  ggplot(aes(x = r, y = roi_name, fill = analysis_set)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray55") +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  labs(
+    title = "Exploratory Spatial Gradients Of Preferred Layer Depth",
+    x = "Best single-axis Spearman r",
+    y = "Network",
+    fill = "Analysis set"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "right")
+
+p_spatial
+save_plot(p_spatial, "r_step7_spatial_gradient_summary.png", width = 11, height = 8)
+```
+
+# 8. Abstract-Ready Result Statements
+
+This section creates a compact table of results that can be copied into a manuscript or abstract draft.
+
+```{r abstract-ready-results}
+get_row <- function(df, roi) df %>% filter(as.character(roi_name) == roi) %>% slice(1)
+
+temp_tsc <- tsc_summary_df %>% filter(as.character(roi_name) == "TempPar") %>% slice(1)
+defb_tsc <- tsc_summary_df %>% filter(as.character(roi_name) == "DefaultB") %>% slice(1)
+temp_best <- best_layer_df %>% filter(roi_name == "TempPar") %>% slice(1)
+
+top_r <- top_parcels_by_r_df %>% slice(1)
+top_gain <- top_parcels_by_gain_df %>% slice(1)
+
+abstract_ready_df <- tibble::tibble(
+  result_type = c(
+    "SRM-only alignment",
+    "SRM-only alignment",
+    "Layer-wise GPT-2 encoding",
+    "Parcel hotspot by best SRM r",
+    "Parcel hotspot by SRM gain",
+    "Parcel-level coupling",
+    "Within-network heterogeneity",
+    "Exploratory spatial gradient"
+  ),
+  statement = c(
+    paste0("TempPar TSC increased from ", fmt_num(temp_tsc$anat_mean), " to ", fmt_num(temp_tsc$shared_mean), " after SRM; delta = ", fmt_num(temp_tsc$delta_mean_shared_minus_anat), "."),
+    paste0("DefaultB TSC increased from ", fmt_num(defb_tsc$anat_mean), " to ", fmt_num(defb_tsc$shared_mean), " after SRM; delta = ", fmt_num(defb_tsc$delta_mean_shared_minus_anat), "."),
+    paste0("TempPar best group-level SRM+LLM encoding occurred at ", temp_best$srm_group_best_layer, ", with SRM r = ", fmt_num(temp_best$srm_group_best_r), " vs Raw r = ", fmt_num(temp_best$raw_group_best_r), "."),
+    paste0(top_r$parcel_label, " showed the highest parcel-level best SRM r = ", fmt_num(top_r$best_srm_r), ", preferred layer = ", top_r$best_srm_layer_index, ", depth = ", fmt_num(top_r$best_srm_log_depth_percent), "%."),
+    paste0(top_gain$parcel_label, " showed the largest same-layer gain = ", fmt_num(top_gain$same_layer_gain), "."),
+    "Across parcels, best SRM r and same-layer SRM gain were strongly correlated (Spearman rho = 0.90348, FDR p < 0.00001).",
+    "Visual and somatomotor networks showed higher preferred-depth heterogeneity, whereas ContB and DefaultA were more internally coherent.",
+    "DefaultA showed the clearest exploratory medial-lateral preferred-depth gradient among high-performing parcels (r = -0.55347, FDR p = 0.03338)."
+  )
+)
+
+write_table_safe(abstract_ready_df, "abstract_ready_key_results")
+kable(abstract_ready_df, caption = "Manuscript-ready summary statements.")
+```
+
+# 9. Export Combined Workbook
+
+```{r export-workbook}
+workbook_path <- write_xlsx_safe(
+  list(
+    srm_tsc_summary = tsc_summary_df,
+    group_layer_paired = group_paired_test,
+    depth_bin_summary = depth_bin_summary_df,
+    subject_overall = subject_overall_summary,
+    subject_best_layer = subject_best_by_network,
+    parcel_kruskal = parcel_kw_df,
+    parcel_correlations = parcel_cor_df,
+    top_parcels_by_r = top_parcels_by_r_df,
+    top_parcels_by_gain = top_parcels_by_gain_df,
+    heterogeneity = heterogeneity_summary_df,
+    spatial_axis = spatial_axis_df,
+    abstract_ready = abstract_ready_df
+  ),
+  "SNL_layerwise_followup_statistics_tables.xlsx"
+)
+
+cat("Workbook path:", workbook_path, "\n")
+cat("Figure directory:", FIGURE_DIR, "\n")
+cat("Table directory:", TABLE_DIR, "\n")
+```
