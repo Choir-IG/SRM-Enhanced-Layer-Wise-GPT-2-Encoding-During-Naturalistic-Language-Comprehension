@@ -1,0 +1,13 @@
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+seaborn
+nibabel
+nilearn
+tqdm
+torch
+transformers
+openpyxl
+xlsxwriter

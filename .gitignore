@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local data and outputs
+data/raw/
+data/derivatives/
+outputs/
+*.nii
+*.nii.gz
+*.npy
+*.npz
+*.pkl
+*.joblib
+
+# Large generated reports
+*.html
+*.pdf
+
+# Local config
+config/paths.yaml
+.env
