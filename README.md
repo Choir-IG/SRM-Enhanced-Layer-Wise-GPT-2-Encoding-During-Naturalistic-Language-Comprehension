@@ -2,7 +2,7 @@
 This repository contains the code used for an SNL 2026 analysis of shared response modeling (SRM), GPT-2 XL layer-wise encoding, parcel-level cortical mapping, and exploratory hemispheric lateralization during naturalistic story comprehension.
 
 The repository is code-only. Raw fMRI data, atlas files, transcripts, audio,
-and generated outputs are not included.
+and generated outputs are not included (or some of them are included in "script").
 
 ## Data And Method References
 
