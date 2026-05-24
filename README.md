@@ -4,6 +4,18 @@ This repository contains the code used for an SNL 2026 analysis of shared respon
 The repository is code-only. Raw fMRI data, atlas files, transcripts, audio,
 and generated outputs are not included.
 
+## Data And Method References
+
+The original fMRI data can be found in the OpenNeuro Narratives dataset
+([ds002345 version 1.1.4](https://openneuro.org/datasets/ds002345/versions/1.1.4)),
+described in *The "Narratives" fMRI dataset for evaluating models of naturalistic
+language comprehension*. The SRM analysis logic was adapted from the
+[BrainIAK SRM tutorial](https://brainiak.org/). The LLM encoding workflow was
+primarily based on the deep fMRI dataset paper
+([Nature Scientific Data](https://www.nature.com/articles/s41597-023-02437-z))
+and the associated GitHub repository
+([HuthLab/deep-fMRI-dataset](https://github.com/HuthLab/deep-fMRI-dataset)).
+
 ## Repository structure
 
 ```text
